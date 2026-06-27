@@ -1,0 +1,577 @@
+'use client';
+
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from 'react';
+import { useApp } from '@/components/layout/app-provider';
+import { Header } from '@/components/layout/header';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { cn } from '@/lib/utils';
+import { Activity, TrendingUp, TrendingDown, Info } from 'lucide-react';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+} from 'recharts';
+
+interface HealthRecord {
+  systolic_bp: number | null;
+  diastolic_bp: number | null;
+  recorded_at: string;
+}
+
+interface DashboardResponse {
+  latestBloodPressure: {
+    systolic_bp: number | null;
+    diastolic_bp: number | null;
+    recorded_at: string;
+  } | null;
+}
+
+interface BloodPressureTrendPoint {
+  x: number;
+  time: string;
+  axisLabel: string;
+  fullTime: string;
+  systolic: number | null;
+  diastolic: number | null;
+}
+
+function formatAxisTime(timestamp: number, range: '1d' | '3d' | '7d') {
+  const date = new Date(timestamp);
+  if (range === '1d') {
+    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  if (range === '3d') {
+    return date.toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  return date.toLocaleDateString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+  });
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+export default function BloodPressurePage() {
+  const { persons, currentPersonId, setCurrentPersonId, alarmCount } = useApp();
+  /*图表交互和页面核心状态*/
+  const interactionOverlayRef = useRef<HTMLDivElement | null>(null);
+  const panStateRef = useRef<{
+    startClientX: number;
+    startRange: { startX: number; endX: number };
+    containerWidth: number;
+  } | null>(null);
+  const [records, setRecords] = useState<HealthRecord[]>([]);
+  const [currentBloodPressure, setCurrentBloodPressure] = useState<DashboardResponse['latestBloodPressure']>(null);
+  const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState<'1d' | '3d' | '7d'>('1d');
+  const [zoomRange, setZoomRange] = useState<{ startX: number; endX: number } | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+
+  /*加载当前人员的血压总览和历史记录*/
+  async function loadData(showLoading = true) {
+    if (!currentPersonId) return;
+    if (showLoading) setLoading(true);
+
+    try {
+      const end = new Date();
+      const start = new Date();
+      if (range === '1d') start.setDate(start.getDate() - 1);
+      else if (range === '3d') start.setDate(start.getDate() - 3);
+      else start.setDate(start.getDate() - 7);
+
+      const [dashboardRes, recordsRes] = await Promise.all([
+        fetch(`/api/dashboard?person_id=${currentPersonId}`, { cache: 'no-store' }),
+        fetch(
+          `/api/health-records?person_id=${currentPersonId}&type=blood_pressure&start=${start.toISOString()}&end=${end.toISOString()}&limit=1000`,
+          { cache: 'no-store' }
+        ),
+      ]);
+      const dashboardData: DashboardResponse = await dashboardRes.json();
+      const recordsData: { records?: HealthRecord[] } = await recordsRes.json();
+
+      setCurrentBloodPressure(dashboardData.latestBloodPressure ?? null);
+      setRecords(recordsData.records || []);
+    } catch {
+      // Silently handle
+    } finally {
+      if (showLoading) setLoading(false);
+    }
+  }
+
+  /*页面加载和时间范围切换后自动刷新数据*/
+  useEffect(() => {
+    if (!currentPersonId) return;
+
+    loadData();
+    const timer = setInterval(() => {
+      void loadData(false);
+    }, 5000);
+
+    return () => clearInterval(timer);
+  }, [currentPersonId, range]);
+
+  /*切换人员或时间范围时重置图表缩放*/
+  useEffect(() => {
+    setZoomRange(null);
+  }, [currentPersonId, range]);
+
+  /*整理血压双折线图数据*/
+  const chartData = useMemo<BloodPressureTrendPoint[]>(() => {
+    return [...records]
+      .sort((a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime())
+      .map((record) => {
+        const timestamp = new Date(record.recorded_at).getTime();
+        return {
+          x: timestamp,
+          time: new Date(record.recorded_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+          axisLabel: formatAxisTime(timestamp, range),
+          fullTime: new Date(record.recorded_at).toLocaleString('zh-CN'),
+          systolic: record.systolic_bp,
+          diastolic: record.diastolic_bp,
+        };
+      });
+  }, [records, range]);
+
+  /*缩放范围超出边界时自动纠正*/
+  useEffect(() => {
+    if (!zoomRange || chartData.length < 2) {
+      return;
+    }
+
+    const fullStart = chartData[0].x;
+    const fullEnd = chartData[chartData.length - 1].x;
+    const nextStart = clamp(zoomRange.startX, fullStart, fullEnd);
+    const nextEnd = clamp(zoomRange.endX, fullStart, fullEnd);
+
+    if (nextStart !== zoomRange.startX || nextEnd !== zoomRange.endX) {
+      if (nextEnd - nextStart <= 0) {
+        setZoomRange(null);
+      } else {
+        setZoomRange({ startX: nextStart, endX: nextEnd });
+      }
+    }
+  }, [chartData, zoomRange]);
+
+  /*处理滚轮缩放图表窗口*/
+  const handleChartWheel = (event: {
+    preventDefault: () => void;
+    clientX: number;
+    deltaY: number;
+    currentTarget: HTMLDivElement;
+  }) => {
+    if (chartData.length < 3) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const cursorRatio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+
+    const fullStart = chartData[0].x;
+    const fullEnd = chartData[chartData.length - 1].x;
+    const currentStart = zoomRange?.startX ?? fullStart;
+    const currentEnd = zoomRange?.endX ?? fullEnd;
+    const currentSpan = currentEnd - currentStart;
+    const fullSpan = fullEnd - fullStart;
+
+    if (currentSpan <= 0 || fullSpan <= 0) {
+      return;
+    }
+
+    const anchorX = currentStart + currentSpan * cursorRatio;
+    const zoomFactor = event.deltaY > 0 ? 1.18 : 0.82;
+    const minSpan = Math.max(fullSpan / 40, 30 * 60 * 1000);
+    const nextSpan = clamp(currentSpan * zoomFactor, minSpan, fullSpan);
+
+    let nextStart = anchorX - (anchorX - currentStart) * (nextSpan / currentSpan);
+    let nextEnd = nextStart + nextSpan;
+
+    if (nextStart < fullStart) {
+      nextStart = fullStart;
+      nextEnd = fullStart + nextSpan;
+    }
+
+    if (nextEnd > fullEnd) {
+      nextEnd = fullEnd;
+      nextStart = fullEnd - nextSpan;
+    }
+
+    if (nextSpan >= fullSpan * 0.98) {
+      setZoomRange(null);
+      return;
+    }
+
+    setZoomRange({
+      startX: Math.max(fullStart, nextStart),
+      endX: Math.min(fullEnd, nextEnd),
+    });
+  };
+
+  /*代理交互层的滚轮事件*/
+  const handleInteractionWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    handleChartWheel(event);
+  };
+
+  /*开始拖拽平移图表*/
+  const handleInteractionPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || chartData.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const fullStart = chartData[0].x;
+    const fullEnd = chartData[chartData.length - 1].x;
+    const currentRange = zoomRange ?? { startX: fullStart, endX: fullEnd };
+
+    if (currentRange.endX - currentRange.startX >= fullEnd - fullStart) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panStateRef.current = {
+      startClientX: event.clientX,
+      startRange: currentRange,
+      containerWidth: rect.width,
+    };
+    setIsPanning(true);
+  };
+
+  /*拖拽过程中平移图表*/
+  const handleInteractionPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    let panState = panStateRef.current;
+    if (!panState && (event.buttons & 1) === 1 && chartData.length >= 2) {
+      const fullStart = chartData[0].x;
+      const fullEnd = chartData[chartData.length - 1].x;
+      const currentRange = zoomRange ?? { startX: fullStart, endX: fullEnd };
+
+      if (currentRange.endX - currentRange.startX < fullEnd - fullStart) {
+        const rect = event.currentTarget.getBoundingClientRect();
+        panState = {
+          startClientX: event.clientX,
+          startRange: currentRange,
+          containerWidth: rect.width,
+        };
+        panStateRef.current = panState;
+        setIsPanning(true);
+      }
+    }
+
+    if (!panState || chartData.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const fullStart = chartData[0].x;
+    const fullEnd = chartData[chartData.length - 1].x;
+    const fullSpan = fullEnd - fullStart;
+    const windowSpan = panState.startRange.endX - panState.startRange.startX;
+    const deltaRatio = (event.clientX - panState.startClientX) / Math.max(panState.containerWidth, 1);
+    const deltaX = deltaRatio * windowSpan;
+
+    let nextStart = panState.startRange.startX - deltaX;
+    let nextEnd = panState.startRange.endX - deltaX;
+
+    if (nextStart < fullStart) {
+      nextStart = fullStart;
+      nextEnd = fullStart + windowSpan;
+    }
+
+    if (nextEnd > fullEnd) {
+      nextEnd = fullEnd;
+      nextStart = fullEnd - windowSpan;
+    }
+
+    if (windowSpan >= fullSpan) {
+      setZoomRange(null);
+      return;
+    }
+
+    setZoomRange({
+      startX: nextStart,
+      endX: nextEnd,
+    });
+  };
+
+  const handleInteractionPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    panStateRef.current = null;
+    setIsPanning(false);
+  };
+
+  useEffect(() => {
+    const overlay = interactionOverlayRef.current;
+    if (!overlay) {
+      return;
+    }
+
+    const nativeWheelHandler = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      handleChartWheel({
+        preventDefault: () => event.preventDefault(),
+        clientX: event.clientX,
+        deltaY: event.deltaY,
+        currentTarget: overlay,
+      });
+    };
+
+    overlay.addEventListener('wheel', nativeWheelHandler, { passive: false });
+
+    return () => {
+      overlay.removeEventListener('wheel', nativeWheelHandler);
+    };
+  }, [chartData, zoomRange]);
+
+  const latest = currentBloodPressure ?? (records.length > 0 ? records[0] : null);
+  const avgSystolic = records.length > 0 
+    ? Math.round(records.reduce((s, r) => s + (r.systolic_bp || 0), 0) / records.length) 
+    : null;
+  const avgDiastolic = records.length > 0 
+    ? Math.round(records.reduce((s, r) => s + (r.diastolic_bp || 0), 0) / records.length) 
+    : null;
+  const maxSystolic = records.length > 0 
+    ? Math.max(...records.map((r) => r.systolic_bp || 0)) 
+    : null;
+  const minSystolic = records.length > 0 
+    ? Math.min(...records.map((r) => r.systolic_bp || 0)) 
+    : null;
+
+  // Blood pressure categories
+  const categories = [
+    { label: '正常', condition: (s: number, d: number) => s < 120 && d < 80, color: '#22C55E' },
+    { label: '偏高', condition: (s: number, d: number) => s >= 120 && s < 130 && d < 80, color: '#EAB308' },
+    { label: '高血压1期', condition: (s: number, d: number) => (s >= 130 && s < 140) || (d >= 80 && d < 90), color: '#F97316' },
+    { label: '高血压2期', condition: (s: number, d: number) => s >= 140 || d >= 90, color: '#EF4444' },
+  ];
+
+  const latestCategory = latest 
+    ? categories.find(c => c.condition(latest.systolic_bp || 0, latest.diastolic_bp || 0)) 
+    : null;
+
+  return (
+    <div className="flex flex-col">
+      <Header
+        persons={persons.map((p) => ({ id: p.id, name: p.name }))}
+        currentPersonId={currentPersonId}
+        onPersonChange={setCurrentPersonId}
+        alarmCount={alarmCount}
+      />
+
+      <div className="p-6 space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
+              <Activity className="h-7 w-7 text-purple-500" />
+              血压监测
+            </h2>
+            <p className="text-sm text-muted-foreground mt-1">收缩压/舒张压历史趋势分析</p>
+          </div>
+          <div className="flex gap-2">
+            {(['1d', '3d', '7d'] as const).map((r) => (
+              <Button
+                key={r}
+                variant={range === r ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setRange(r)}
+                className={range === r ? 'bg-purple-500 hover:bg-purple-600' : ''}
+              >
+                {r === '1d' ? '24小时' : r === '3d' ? '3天' : '7天'}
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        {/* Stats row */}
+        <div className="grid grid-cols-4 gap-4">
+          {[
+            { label: '当前血压', value1: latest?.systolic_bp, value2: latest?.diastolic_bp, unit: 'mmHg', icon: Activity, color: 'text-purple-600' },
+            { label: '平均收缩压', value1: avgSystolic, unit: 'mmHg', icon: TrendingUp, color: 'text-blue-600' },
+            { label: '最高收缩压', value1: maxSystolic, unit: 'mmHg', icon: TrendingUp, color: 'text-red-600' },
+            { label: '最低收缩压', value1: minSystolic, unit: 'mmHg', icon: TrendingDown, color: 'text-green-600' },
+          ].map((stat, idx) => (
+            <Card key={idx}>
+              <CardContent className="pt-4 pb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <stat.icon className={`h-4 w-4 ${stat.color}`} />
+                  <span className="text-xs text-muted-foreground">{stat.label}</span>
+                </div>
+                <div className="flex items-baseline gap-1">
+                  {stat.value1 !== null && stat.value1 !== undefined && (
+                    <span className={`text-2xl font-bold tabular-nums ${stat.color}`}>
+                      {stat.value1}
+                    </span>
+                  )}
+                  {stat.value2 !== null && stat.value2 !== undefined && (
+                    <>
+                      <span className="text-lg text-muted-foreground">/</span>
+                      <span className={`text-xl font-bold tabular-nums ${stat.color}`}>
+                        {stat.value2}
+                      </span>
+                    </>
+                  )}
+                  <span className="text-xs text-muted-foreground">{stat.unit}</span>
+                </div>
+                {idx === 0 && latestCategory && (
+                  <Badge 
+                    className="mt-2" 
+                    style={{ backgroundColor: latestCategory.color }}
+                  >
+                    {latestCategory.label}
+                  </Badge>
+                )}
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        {/* Chart */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-lg font-semibold">血压趋势</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div
+              className={cn(
+                'relative h-80 overscroll-contain select-none',
+                isPanning ? 'cursor-grabbing' : 'cursor-default'
+              )}
+              onDoubleClick={() => setZoomRange(null)}
+            >
+              {loading ? (
+                <div className="flex items-center justify-center h-full">
+                  <div className="h-6 w-6 animate-spin rounded-full border-2 border-purple-500 border-t-transparent" />
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="systolicGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#9333EA" stopOpacity={0.15} />
+                        <stop offset="95%" stopColor="#9333EA" stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="diastolicGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#7C3AED" stopOpacity={0.15} />
+                        <stop offset="95%" stopColor="#7C3AED" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
+                    <XAxis
+                      type="number"
+                      dataKey="x"
+                      scale="time"
+                      domain={zoomRange ? [zoomRange.startX, zoomRange.endX] : ['dataMin', 'dataMax']}
+                      allowDataOverflow
+                      tick={{ fontSize: 11, fill: '#94A3B8' }}
+                      minTickGap={range === '1d' ? 24 : 42}
+                      tickMargin={10}
+                      tickFormatter={(value: number) => formatAxisTime(value, range)}
+                    />
+                    <YAxis domain={[50, 180]} tick={{ fontSize: 11, fill: '#94A3B8' }} />
+                    <Tooltip
+                      contentStyle={{ fontSize: '12px', borderRadius: '8px', border: '1px solid #E2E8F0' }}
+                      formatter={(value: number, name: string) => [
+                        `${value} mmHg`, 
+                        name === 'systolic' ? '收缩压' : '舒张压'
+                      ]}
+                      labelFormatter={(_label, payload) => {
+                        const point = payload?.[0]?.payload as { fullTime?: string } | undefined;
+                        return point?.fullTime ?? '';
+                      }}
+                    />
+                    <ReferenceLine y={140} stroke="#EF4444" strokeDasharray="6 3" label={{ value: '高压', position: 'right', fill: '#EF4444', fontSize: 11 }} />
+                    <ReferenceLine y={90} stroke="#F97316" strokeDasharray="6 3" label={{ value: '低压', position: 'right', fill: '#F97316', fontSize: 11 }} />
+                    <Line
+                      type="monotone"
+                      dataKey="systolic"
+                      stroke="#9333EA"
+                      strokeWidth={2.5}
+                      dot={false}
+                      activeDot={{ r: 5, fill: '#9333EA', strokeWidth: 2, stroke: '#fff' }}
+                      name="systolic"
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="diastolic"
+                      stroke="#7C3AED"
+                      strokeWidth={2}
+                      dot={false}
+                      activeDot={{ r: 4, fill: '#7C3AED', strokeWidth: 2, stroke: '#fff' }}
+                      name="diastolic"
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+              <div
+                ref={interactionOverlayRef}
+                className="absolute inset-0 z-10"
+                onWheel={handleInteractionWheel}
+                onPointerDown={handleInteractionPointerDown}
+                onPointerMove={handleInteractionPointerMove}
+                onPointerUp={handleInteractionPointerUp}
+                onPointerCancel={handleInteractionPointerUp}
+                onContextMenu={(event) => event.preventDefault()}
+              />
+            </div>
+            <p className="mt-3 text-xs text-slate-500">
+              在图表区域滚动鼠标滚轮可缩放时间窗口，左键按住可左右拖动时间窗，双击可重置到全局视图。
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* Info card */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-lg font-semibold flex items-center gap-2">
+              <Info className="h-5 w-5 text-slate-500" />
+              血压分级参考
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              {[
+                { label: '正常', range: '收缩压 < 120 且 舒张压 < 80', color: '#22C55E' },
+                { label: '血压偏高', range: '120 ≤ 收缩压 < 130 且 舒张压 < 80', color: '#EAB308' },
+                { label: '高血压1期', range: '130 ≤ 收缩压 < 140 或 80 ≤ 舒张压 < 90', color: '#F97316' },
+                { label: '高血压2期', range: '收缩压 ≥ 140 或 舒张压 ≥ 90', color: '#EF4444' },
+              ].map((item, idx) => (
+                <div key={idx} className="p-4 rounded-lg" style={{ backgroundColor: `${item.color}15` }}>
+                  <span className="text-sm font-bold" style={{ color: item.color }}>
+                    {item.label}
+                  </span>
+                  <p className="text-xs text-muted-foreground mt-1">{item.range}</p>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
